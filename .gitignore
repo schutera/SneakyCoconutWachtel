@@ -1,0 +1,11 @@
+# secrets & local state
+.env
+data/
+
+# python venv
+.venv/
+__pycache__/
+
+# rendered systemd units / caddy config
+systemd/*.rendered
+Caddyfile

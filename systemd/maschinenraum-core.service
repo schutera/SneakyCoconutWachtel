@@ -1,0 +1,22 @@
+[Unit]
+Description=maschinenraum — vLLM text+vision server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__MR_USER__
+WorkingDirectory=__MR_HOME__
+EnvironmentFile=__MR_HOME__/.env
+ExecStart=__MR_HOME__/run.sh core
+ExecStartPost=-__MR_HOME__/lib/notify.sh "🟢 maschinenraum core (text+vision) starting up"
+ExecStopPost=-__MR_HOME__/lib/notify.sh "🔴 maschinenraum core stopped"
+Restart=always
+RestartSec=10
+# Model loads can be slow; give it room before systemd calls it failed.
+TimeoutStartSec=600
+StandardOutput=append:__MR_HOME__/data/logs/core.log
+StandardError=append:__MR_HOME__/data/logs/core.log
+
+[Install]
+WantedBy=multi-user.target
