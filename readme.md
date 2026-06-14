@@ -61,10 +61,86 @@ Everything lives in `.env` (copied from `.env.example`, gitignored). Highlights:
 | `CLOUDFLARE_TUNNEL_TOKEN` | Named-tunnel token → stable hostname (blank = ephemeral URL) |
 | `DISCORD_WEBHOOK_URL` | Notifications (blank disables them) |
 
-**Remote access:** with a `CLOUDFLARE_TUNNEL_TOKEN` you get a stable hostname
-(configured in the Cloudflare dashboard → point it at `127.0.0.1:MR_EDGE_PORT`).
-Without one, a free `*.trycloudflare.com` URL is created on each start and posted
-to Discord.
+**Remote access:** see the full [Cloudflare Tunnel setup](#cloudflare-tunnel-setup)
+section below — it's the fiddliest part, so it's written out click-by-click.
+
+## Cloudflare Tunnel setup
+
+This is what exposes the box to the internet without opening any ports on your
+router. There are two paths — pick one.
+
+### No domain? Use the quick tunnel (zero setup)
+
+Leave `CLOUDFLARE_TUNNEL_TOKEN` **blank** in `.env`. On every start, `cloudflared`
+creates a throwaway `https://<random>.trycloudflare.com` URL and posts it to your
+Discord webhook. Nothing to configure. The catch: **the URL changes on every
+restart**, so it's good for testing, not for handing a stable address to your wife
+or an app. If you want a fixed hostname, do the named tunnel below.
+
+### Stable hostname: named tunnel (recommended)
+
+You need a domain whose nameservers are managed by Cloudflare (adding a site to
+Cloudflare walks you through pointing your registrar's nameservers at it — this
+propagates in minutes to a few hours).
+
+**1. Open Zero Trust.** In the [Cloudflare dashboard](https://dash.cloudflare.com),
+left sidebar → **Zero Trust**. The first time, it asks you to pick a team name and
+a plan — choose **Free** (it may ask for a card but won't charge for this).
+
+**2. Create the tunnel.** Zero Trust → **Networks → Tunnels → Create a tunnel** →
+choose **Cloudflared** → name it (e.g. `maschinenraum`) → **Save**.
+
+**3. Grab the token.** The next screen shows install commands containing a long
+token (the string after `--token`, starts with `eyJ...`). You don't need to run
+their command — our setup already installs `cloudflared`. Just **copy that token**.
+
+**4. Put it in `.env`:**
+
+```bash
+CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoi... (the long token)
+MR_PUBLIC_HOSTNAME=ai.yourdomain.com   # for docs/printing only
+```
+
+**5. Add the public hostname.** Still in the tunnel's setup wizard (or later via
+the tunnel's **Public Hostname** tab → **Add a public hostname**):
+
+| Field | Value |
+|-------|-------|
+| Subdomain | `ai` (or whatever you like) |
+| Domain | `yourdomain.com` (pick from the dropdown) |
+| Path | *(leave empty)* |
+| Type | **HTTP** |
+| URL | `localhost:8080` |
+
+> ⚠️ The **URL** must be **HTTP** (not HTTPS — TLS is terminated at Cloudflare's
+> edge) and the **port must match `MR_EDGE_PORT`**: `8080` when Whisper is enabled
+> (traffic goes through the Caddy router), or `8000` (`MR_PORT`) if you set
+> `MR_ENABLE_WHISPER=false`. This single mismatch is the #1 cause of `502`s.
+
+Cloudflare auto-creates the DNS record for `ai.yourdomain.com` — you don't add one
+manually.
+
+**6. Apply it.** Re-run `./setup.sh` (or just
+`sudo systemctl restart maschinenraum-tunnel`). Then from anywhere:
+
+```bash
+curl https://ai.yourdomain.com/v1/models -H "Authorization: Bearer $MR_API_KEY"
+```
+
+### When it doesn't work
+
+| Symptom | Usual cause |
+|---------|-------------|
+| **502 Bad Gateway** | The tunnel's service URL port ≠ `MR_EDGE_PORT`, or vLLM isn't up yet. Check `sudo systemctl status maschinenraum-core` and `tail data/logs/core.log`. |
+| **Error 1033 / "tunnel not found"** | `cloudflared` isn't connected. `sudo systemctl status maschinenraum-tunnel` and `tail data/logs/tunnel.log`; verify the token in `.env`. |
+| **DNS won't resolve** | Domain's nameservers aren't on Cloudflare yet, or the hostname wasn't added in step 5. The record's proxy (orange cloud) must be **on**. |
+| **521/523** | Service URL set to `https://...` instead of `http://...`. |
+| **Works locally, not remotely** | You restarted the `core`/`edge` services but not `maschinenraum-tunnel`. |
+
+> **Optional — lock it to just you two.** Since you're sharing with your wife, you
+> can add **Zero Trust → Access → Applications** in front of the hostname with an
+> email allowlist, so only your two logins can even reach the API (on top of the
+> API key). Not required, but a nice second lock.
 
 ## Using it
 
