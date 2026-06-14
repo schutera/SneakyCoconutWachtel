@@ -8,14 +8,17 @@ your terminal AI, your (separately hosted) chat UI, and your own apps.
 clients (terminal CLI · chat UI · custom apps, from anywhere)
         │   Authorization: Bearer <MR_API_KEY>
         ▼
-  Cloudflare Tunnel ──▶ Caddy router ──┬─▶ vLLM   text + vision   /v1/chat, /v1/embeddings
-   (remote, HTTPS)      (one endpoint)  └─▶ Whisper STT            /v1/audio/transcriptions
+  Cloudflare Tunnel ──▶ Caddy router ──┬─▶ vLLM           text + vision   /v1/chat, /v1/embeddings
+   (remote, HTTPS)      (auth + route)  └─▶ faster-whisper  STT            /v1/audio/transcriptions
 ```
 
 - **vLLM** — high throughput via continuous batching + prefix caching. Multiple
   users hit it in parallel without each paying full latency.
-- **One endpoint, one key** — a small Caddy router merges chat/vision and audio
-  behind a single hostname so every client just sets a base URL + key.
+- **One endpoint, one key** — the Caddy router enforces the API key on every
+  route and merges chat/vision and audio behind a single hostname, so every
+  client just sets a base URL + key.
+- **No GPU tug-of-war** — STT runs as a dedicated, lazy-allocating faster-whisper
+  server (or fully on CPU), not a second vLLM fighting for a preallocated slab.
 - **Remote from day one** — Cloudflare Tunnel, no open ports.
 - **Stays in the loop** — Discord daily health ping + weekly usage digest, sourced
   straight from vLLM's Prometheus `/metrics` (no Grafana to run or check).
@@ -59,7 +62,8 @@ Everything lives in `.env` (copied from `.env.example`, gitignored). Highlights:
 | `MR_MODEL` | Model id; blank = auto-pick from VRAM |
 | `MR_GPU_MEMORY_UTILIZATION` | Fraction of VRAM for the main model (default `0.90`) |
 | `MR_MAX_MODEL_LEN` / `MR_MAX_NUM_SEQS` | Context length / concurrency tuning |
-| `MR_ENABLE_WHISPER` | `true` runs Whisper STT behind the router |
+| `MR_ENABLE_WHISPER` | `true` runs a faster-whisper STT server behind the router |
+| `MR_WHISPER_DEVICE` | `cuda` (shares the GPU) or `cpu` (no GPU contention, slower) |
 | `CLOUDFLARE_TUNNEL_TOKEN` | Named-tunnel token → stable hostname (blank = ephemeral URL) |
 | `DISCORD_WEBHOOK_URL` | Notifications (blank disables them) |
 
@@ -180,7 +184,7 @@ curl https://<host>/v1/chat/completions -H "Authorization: Bearer $MR_API_KEY" \
 
 ```bash
 curl https://<host>/v1/audio/transcriptions -H "Authorization: Bearer $MR_API_KEY" \
-  -F file=@clip.mp3 -F model=openai/whisper-large-v3-turbo
+  -F file=@clip.mp3 -F model=Systran/faster-whisper-large-v3
 ```
 
 ## Operations
@@ -204,8 +208,8 @@ manual run by restarting it: `docker compose restart notifier`.
 
 - `setup.sh` — installer/orchestrator: installs Docker + the NVIDIA toolkit,
   writes `.env`/`Caddyfile`, picks profiles, brings the stack up (idempotent).
-- `docker-compose.yml` — services: `vllm`, `whisper` (profile), `caddy`,
-  `cloudflared-token`/`-quick` (profiles), `notifier`.
+- `docker-compose.yml` — services: `vllm`, `whisper` (faster-whisper, profile),
+  `caddy` (auth + router), `cloudflared-token`/`-quick` (profiles), `notifier`.
 - `lib/` — `detect_gpu`, `pick_model`, `notify` (host helpers) and `notifier.py`
   (the in-container Discord health/digest loop).
 - `Caddyfile` — generated router; one hostname for chat + audio.

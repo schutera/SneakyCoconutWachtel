@@ -84,17 +84,25 @@ else
 fi
 load_env
 
-# ── 4. Caddy router config ─────────────────────────────────────────────────
+# ── 4. Caddy router config (central API-key auth for every route) ──────────
 {
   echo "{"
   echo -e "\tadmin off"
   echo -e "\tauto_https off"
   echo "}"
   echo ":$(cfg MR_EDGE_PORT 8080) {"
+  echo -e "\t# Gate every route on the API key (read from the container env)."
+  echo -e "\t# OPTIONS is allowed through so browser CORS preflights aren't blocked."
+  echo -e "\t@unauthorized {"
+  echo -e "\t\tnot header Authorization \"Bearer {env.MR_API_KEY}\""
+  echo -e "\t\tnot method OPTIONS"
+  echo -e "\t}"
+  echo -e "\thandle @unauthorized {"
+  echo -e "\t\trespond \"Unauthorized\" 401"
+  echo -e "\t}"
   if [ "$ENABLE_WHISPER" = "true" ]; then
-    echo -e "\t@audio path /v1/audio/*"
-    echo -e "\thandle @audio {"
-    echo -e "\t\treverse_proxy whisper:$(cfg MR_WHISPER_PORT 8001)"
+    echo -e "\thandle /v1/audio/* {"
+    echo -e "\t\treverse_proxy whisper:8000"
     echo -e "\t}"
   fi
   echo -e "\thandle {"
@@ -102,16 +110,22 @@ load_env
   echo -e "\t}"
   echo "}"
 } > "$MR_HOME/Caddyfile"
-log "Wrote Caddyfile."
+log "Wrote Caddyfile (central auth + routing)."
 
-# ── 5. reconcile GPU memory split (avoid two-process OOM) ───────────────────
-# core + whisper fractions must leave headroom for activation spikes.
-CORE_FRAC="$(cfg MR_GPU_MEMORY_UTILIZATION 0.90)"
-if [ "$ENABLE_WHISPER" = "true" ]; then
-  # Only auto-lower if the user left the default; respect an explicit value.
-  awk "BEGIN{exit !($CORE_FRAC > 0.82)}" && CORE_FRAC=0.80
+# ── 5. device-aware GPU reconciliation ─────────────────────────────────────
+# faster-whisper on the GPU is small but real; lower the core model's slab so
+# the two leave headroom. On CPU there's no contention, so leave core as-is.
+WHISPER_DEVICE="$(cfg MR_WHISPER_DEVICE cuda)"
+if [ "$ENABLE_WHISPER" = "true" ] && [ "$WHISPER_DEVICE" = "cuda" ]; then
+  CORE_FRAC="$(cfg MR_GPU_MEMORY_UTILIZATION 0.90)"
+  awk "BEGIN{exit !($CORE_FRAC > 0.82)}" && CORE_FRAC=0.80   # only lower a default
   export MR_GPU_MEMORY_UTILIZATION="$CORE_FRAC"
-  log "Whisper on → core GPU fraction $CORE_FRAC + whisper $(cfg MR_WHISPER_GPU_FRACTION 0.10)."
+  log "Whisper on GPU → core fraction $CORE_FRAC (leaves VRAM for faster-whisper)."
+fi
+# Pick the CPU image automatically when the user asked for CPU Whisper.
+if [ "$ENABLE_WHISPER" = "true" ] && [ "$WHISPER_DEVICE" = "cpu" ] && [ -z "${MR_WHISPER_IMAGE:-}" ]; then
+  export MR_WHISPER_IMAGE="ghcr.io/speaches-ai/speaches:latest-cpu"
+  log "Whisper on CPU → using $MR_WHISPER_IMAGE (no GPU contention)."
 fi
 
 # ── 6. choose profiles + bring the stack up ────────────────────────────────

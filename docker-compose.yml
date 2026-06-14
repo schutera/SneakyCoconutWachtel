@@ -48,20 +48,21 @@ services:
       start_period: 600s           # big models can take a while to load
 
   # ── Whisper STT (optional: --profile whisper) ────────────────────────────
+  # Dedicated faster-whisper (CTranslate2) server — small, lazy-allocating, and
+  # coexists predictably with vLLM instead of preallocating a VRAM slab.
+  # Internal only (port 8000); auth is enforced at the Caddy router. Set
+  # MR_WHISPER_DEVICE=cpu to take it off the GPU entirely.
   whisper:
-    image: ${MR_VLLM_IMAGE:-vllm/vllm-openai:latest}
+    image: ${MR_WHISPER_IMAGE:-ghcr.io/speaches-ai/speaches:latest-cuda}
     <<: [*gpu, *logging]
     profiles: [whisper]
     restart: unless-stopped
-    ipc: host
     environment:
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
-    command: >
-      --model ${MR_WHISPER_MODEL:-openai/whisper-large-v3-turbo}
-      --host 0.0.0.0
-      --port ${MR_WHISPER_PORT:-8001}
-      --api-key ${MR_API_KEY}
-      --gpu-memory-utilization ${MR_WHISPER_GPU_FRACTION:-0.10}
+      WHISPER__MODEL: ${MR_WHISPER_MODEL:-Systran/faster-whisper-large-v3}
+      WHISPER__INFERENCE_DEVICE: ${MR_WHISPER_DEVICE:-cuda}
+      WHISPER__COMPUTE_TYPE: ${MR_WHISPER_COMPUTE_TYPE:-int8_float16}
+      WHISPER__TTL: "-1"        # keep the model loaded (no cold-start reloads)
+      HF_TOKEN: ${HF_TOKEN:-}
     volumes:
       - ./data/hf:/root/.cache/huggingface
 
@@ -71,6 +72,8 @@ services:
     <<: *logging
     restart: unless-stopped
     depends_on: [vllm]
+    environment:
+      MR_API_KEY: ${MR_API_KEY}   # used by the Caddyfile to gate every route
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./data/caddy:/data

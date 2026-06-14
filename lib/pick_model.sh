@@ -19,8 +19,8 @@ pick_text_model() {
   fi
 }
 
-# Whisper is small (~2-3 GB); large-v3-turbo is the best speed/quality tradeoff.
-pick_whisper_model() { echo "openai/whisper-large-v3-turbo"; }
+# faster-whisper (CTranslate2) default; overridable via MR_WHISPER_MODEL.
+pick_whisper_model() { echo "Systran/faster-whisper-large-v3"; }
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
   source "$MR_HOME/lib/detect_gpu.sh"
