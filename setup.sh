@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
-# maschinenraum — one-shot, idempotent setup.
+# maschinenraum — one-shot, idempotent setup (Docker Compose).
 #   git clone … && cd maschinenraum && ./setup.sh
-# Installs vLLM (text+vision) + optional Whisper STT behind a Caddy router,
-# wires a Cloudflare tunnel for remote access, autostart via systemd, and
-# Discord health/digest pings. Safe to re-run.
+# Installs Docker + NVIDIA container toolkit if needed, then brings up vLLM
+# (text+vision), optional Whisper STT, a Caddy router, a Cloudflare tunnel, and
+# a Discord notifier. Safe to re-run.
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/common.sh"
 source "$MR_HOME/lib/detect_gpu.sh"
 source "$MR_HOME/lib/pick_model.sh"
+source "$MR_HOME/lib/notify.sh"
 
-MR_USER="${SUDO_USER:-$USER}"
-SYSTEMD_DIR=/etc/systemd/system
-
-# Set or replace KEY=value in .env (creates the line if absent).
-set_env() {
+set_env() {  # set or replace KEY=value in .env
   local key="$1" val="$2" file="$MR_HOME/.env"
   python3 - "$file" "$key" "$val" <<'PY'
 import sys, pathlib
@@ -35,33 +32,51 @@ PY
 log "Preflight checks…"
 [ "$(uname -s)" = "Linux" ] || die "This setup targets Linux + NVIDIA. Detected $(uname -s)."
 require_gpu
-for c in curl python3 sudo; do command -v "$c" >/dev/null || die "missing required tool: $c"; done
-mkdir -p "$MR_LOG_DIR" "$MR_STATE_DIR"
+for c in curl python3; do command -v "$c" >/dev/null || die "missing required tool: $c"; done
+command -v sudo >/dev/null || die "sudo is required to install Docker / the NVIDIA toolkit."
+mkdir -p "$MR_LOG_DIR" "$MR_STATE_DIR" "$MR_HOME/data/hf" "$MR_HOME/data/caddy"
 log "GPU: $(gpu_name) · $(gpu_vram_mib) MiB VRAM"
 
-# ── 2. config (.env) ───────────────────────────────────────────────────────
-if [ ! -f "$MR_HOME/.env" ]; then
-  cp "$MR_HOME/.env.example" "$MR_HOME/.env"
-  log "Created .env from template — edit it for Cloudflare/Discord secrets."
+# ── 2. Docker + NVIDIA container toolkit ───────────────────────────────────
+if ! command -v docker >/dev/null 2>&1; then
+  log "Installing Docker…"
+  curl -fsSL https://get.docker.com | sudo sh
+  sudo usermod -aG docker "${SUDO_USER:-$USER}" || true
 fi
+docker compose version >/dev/null 2>&1 || die "Docker Compose v2 not available — update Docker."
+
+# Install the NVIDIA toolkit only if GPUs aren't already visible to Docker.
+if ! sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then
+    log "Installing NVIDIA container toolkit…"
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+      | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list >/dev/null
+    sudo apt-get update -qq && sudo apt-get install -y -qq nvidia-container-toolkit
+    sudo nvidia-ctk runtime configure --runtime=docker
+    sudo systemctl restart docker
+  else
+    die "GPUs not visible to Docker and no apt-get to auto-install the NVIDIA toolkit.
+Install nvidia-container-toolkit manually, then re-run: https://docs.nvidia.com/datacenter/cloud-native/"
+  fi
+fi
+
+# ── 3. config (.env) ───────────────────────────────────────────────────────
+[ -f "$MR_HOME/.env" ] || { cp "$MR_HOME/.env.example" "$MR_HOME/.env"; log "Created .env from template."; }
 load_env
 
 if [ -z "${MR_API_KEY:-}" ]; then
-  newkey="mr-$(openssl rand -hex 24)"
-  set_env MR_API_KEY "$newkey"
-  log "Generated MR_API_KEY."
+  set_env MR_API_KEY "mr-$(openssl rand -hex 24)"; log "Generated MR_API_KEY."
 fi
-
 if [ -z "${MR_MODEL:-}" ]; then
   model="$(pick_text_model "$(gpu_vram_mib)")"
-  set_env MR_MODEL "$model"
-  log "Auto-picked model for your VRAM: $model  (override MR_MODEL in .env)"
+  set_env MR_MODEL "$model"; log "Auto-picked model: $model  (override MR_MODEL in .env)"
 fi
 load_env
 
 ENABLE_WHISPER="$(cfg MR_ENABLE_WHISPER true)"
-
-# Whisper off → Cloudflare points straight at vLLM; on → at the Caddy router.
 if [ "$ENABLE_WHISPER" = "true" ]; then
   set_env MR_EDGE_PORT "$(cfg MR_EDGE_PORT 8080)"
 else
@@ -69,84 +84,69 @@ else
 fi
 load_env
 
-# ── 3. python env + vLLM ───────────────────────────────────────────────────
-if ! command -v uv >/dev/null 2>&1; then
-  log "Installing uv…"
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="$HOME/.local/bin:$PATH"
-fi
-if [ ! -x "$MR_VENV/bin/vllm" ]; then
-  log "Creating venv + installing vLLM (this pulls CUDA wheels, be patient)…"
-  uv venv "$MR_VENV" --python 3.12
-  uv pip install --python "$MR_VENV/bin/python" vllm
-else
-  log "vLLM already installed — skipping."
-fi
-
-# ── 4. Caddy router (only if Whisper is enabled) ───────────────────────────
-if [ "$ENABLE_WHISPER" = "true" ]; then
-  if ! command -v caddy >/dev/null 2>&1; then
-    log "Installing Caddy (single static binary)…"
-    arch="$(uname -m)"; case "$arch" in x86_64) arch=amd64;; aarch64|arm64) arch=arm64;; esac
-    sudo curl -fsSL "https://caddyserver.com/api/download?os=linux&arch=${arch}" -o /usr/bin/caddy
-    sudo chmod +x /usr/bin/caddy
-  fi
-  cat > "$MR_HOME/Caddyfile" <<EOF
+# ── 4. Caddy router config ─────────────────────────────────────────────────
 {
-	admin off
-	auto_https off
-}
-:$(cfg MR_EDGE_PORT 8080) {
-	@audio path /v1/audio/*
-	handle @audio {
-		reverse_proxy 127.0.0.1:$(cfg MR_WHISPER_PORT 8001)
-	}
-	handle {
-		reverse_proxy 127.0.0.1:$(cfg MR_PORT 8000)
-	}
-}
-EOF
-  log "Wrote Caddyfile (router: /v1/audio/* → Whisper, else → vLLM)."
+  echo "{"
+  echo -e "\tadmin off"
+  echo -e "\tauto_https off"
+  echo "}"
+  echo ":$(cfg MR_EDGE_PORT 8080) {"
+  if [ "$ENABLE_WHISPER" = "true" ]; then
+    echo -e "\t@audio path /v1/audio/*"
+    echo -e "\thandle @audio {"
+    echo -e "\t\treverse_proxy whisper:$(cfg MR_WHISPER_PORT 8001)"
+    echo -e "\t}"
+  fi
+  echo -e "\thandle {"
+  echo -e "\t\treverse_proxy vllm:$(cfg MR_PORT 8000)"
+  echo -e "\t}"
+  echo "}"
+} > "$MR_HOME/Caddyfile"
+log "Wrote Caddyfile."
+
+# ── 5. reconcile GPU memory split (avoid two-process OOM) ───────────────────
+# core + whisper fractions must leave headroom for activation spikes.
+CORE_FRAC="$(cfg MR_GPU_MEMORY_UTILIZATION 0.90)"
+if [ "$ENABLE_WHISPER" = "true" ]; then
+  # Only auto-lower if the user left the default; respect an explicit value.
+  awk "BEGIN{exit !($CORE_FRAC > 0.82)}" && CORE_FRAC=0.80
+  export MR_GPU_MEMORY_UTILIZATION="$CORE_FRAC"
+  log "Whisper on → core GPU fraction $CORE_FRAC + whisper $(cfg MR_WHISPER_GPU_FRACTION 0.10)."
 fi
 
-# ── 5. systemd units ───────────────────────────────────────────────────────
-log "Installing systemd units…"
-units=(maschinenraum-core.service maschinenraum-tunnel.service
-       maschinenraum-health.service maschinenraum-health.timer
-       maschinenraum-digest.service maschinenraum-digest.timer)
-[ "$ENABLE_WHISPER" = "true" ] && units+=(maschinenraum-whisper.service maschinenraum-edge.service)
+# ── 6. choose profiles + bring the stack up ────────────────────────────────
+profiles=()
+[ "$ENABLE_WHISPER" = "true" ] && profiles+=(whisper)
+if [ -n "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then profiles+=(tunnel-token); else profiles+=(tunnel-quick); fi
+export COMPOSE_PROFILES="$(IFS=,; echo "${profiles[*]}")"
+log "Compose profiles: $COMPOSE_PROFILES"
 
-for u in "${units[@]}"; do
-  sed -e "s|__MR_HOME__|$MR_HOME|g" -e "s|__MR_USER__|$MR_USER|g" \
-    "$MR_HOME/systemd/$u" | sudo tee "$SYSTEMD_DIR/$u" >/dev/null
-done
-sudo systemctl daemon-reload
+log "Pulling images + starting (first run downloads the model — be patient)…"
+sudo -E docker compose -f "$MR_HOME/docker-compose.yml" up -d --remove-orphans
 
-enable_units=(maschinenraum-core.service maschinenraum-tunnel.service
-              maschinenraum-health.timer maschinenraum-digest.timer)
-[ "$ENABLE_WHISPER" = "true" ] && enable_units+=(maschinenraum-whisper.service maschinenraum-edge.service)
-sudo systemctl enable --now "${enable_units[@]}"
-
-# ── 6. verify + announce ───────────────────────────────────────────────────
-log "Waiting for the model to load and the API to come up…"
+# ── 7. verify + announce ───────────────────────────────────────────────────
+log "Waiting for the API…"
 ok=false
-for _ in $(seq 1 120); do
+for _ in $(seq 1 180); do
   if curl -fsS -m 3 -H "Authorization: Bearer $(cfg MR_API_KEY)" \
-       "http://127.0.0.1:$(cfg MR_PORT 8000)/health" >/dev/null 2>&1; then
-    ok=true; break
-  fi
+       "http://127.0.0.1:$(cfg MR_PORT 8000)/health" >/dev/null 2>&1; then ok=true; break; fi
   sleep 5
 done
 
-"$MR_HOME/lib/metrics_digest.sh" health || true
+# Quick tunnel: surface the ephemeral URL to Discord + console.
+if [ -z "${CLOUDFLARE_TUNNEL_TOKEN:-}" ]; then
+  url="$(sudo docker compose -f "$MR_HOME/docker-compose.yml" logs cloudflared-quick 2>/dev/null \
+        | grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' | head -n1 || true)"
+  if [ -n "$url" ]; then
+    log "Quick tunnel: $url"
+    discord_send "🌍 **maschinenraum** reachable at <$url> (ephemeral — set CLOUDFLARE_TUNNEL_TOKEN for a stable hostname)."
+  fi
+fi
 
 echo
-if [ "$ok" = true ]; then
-  log "✅ maschinenraum is up."
-else
-  warn "API didn't answer yet — large models can take a while. Tail: journalctl -u maschinenraum-core -f"
-fi
-host="$(cfg MR_PUBLIC_HOSTNAME)"; [ -n "$host" ] && host="https://$host" || host="(see Discord for the quick-tunnel URL)"
+[ "$ok" = true ] && log "✅ maschinenraum is up." \
+  || warn "API not answering yet — large models take time. Logs: sudo docker compose logs -f vllm"
+host="$(cfg MR_PUBLIC_HOSTNAME)"; [ -n "$host" ] && host="https://$host" || host="(quick-tunnel URL above / in Discord)"
 cat <<EOF
 
   Endpoint (local):  http://localhost:$(cfg MR_PORT 8000)/v1
@@ -154,9 +154,9 @@ cat <<EOF
   API key:           in .env (MR_API_KEY)
 
   Quick test:
-    curl http://localhost:$(cfg MR_PORT 8000)/v1/chat/completions \\
+    source .env && curl http://localhost:$(cfg MR_PORT 8000)/v1/chat/completions \\
       -H "Authorization: Bearer \$MR_API_KEY" -H "Content-Type: application/json" \\
       -d '{"model":"maschinenraum","messages":[{"role":"user","content":"hi"}]}'
 
-  See README.md for terminal-AI, chat-UI, and custom-app setup.
+  See readme.md for terminal-AI, chat-UI, and custom-app setup.
 EOF

@@ -19,12 +19,14 @@ clients (terminal CLI · chat UI · custom apps, from anywhere)
 - **Remote from day one** — Cloudflare Tunnel, no open ports.
 - **Stays in the loop** — Discord daily health ping + weekly usage digest, sourced
   straight from vLLM's Prometheus `/metrics` (no Grafana to run or check).
-- **Always on** — systemd autostart + auto-restart on crash or reboot.
+- **Always on** — Docker `restart: unless-stopped` brings every service back on
+  crash or reboot.
 
 ## Requirements
 
 - Linux with an NVIDIA GPU + recent driver (`nvidia-smi` must work)
 - `curl`, `python3`, `sudo`
+- Docker + the NVIDIA container toolkit — **auto-installed by `setup.sh`** if missing
 - (Optional) a Cloudflare account + domain for a stable hostname
 - (Optional) a Discord webhook URL for notifications
 
@@ -38,10 +40,10 @@ cd maschinenraum
 
 `setup.sh` is idempotent — re-run it any time. It will:
 
-1. Verify the GPU and detect VRAM.
+1. Verify the GPU; install Docker + the NVIDIA container toolkit if missing.
 2. Create `.env`, generate a strong `MR_API_KEY`, and auto-pick a model for your VRAM.
-3. Install vLLM into a local `uv` venv (+ Caddy if Whisper is enabled).
-4. Install and start systemd services (core, Whisper, router, tunnel, timers).
+3. Generate the Caddy router config and reconcile the GPU memory split.
+4. `docker compose up -d` the stack (vLLM, Whisper, Caddy, tunnel, notifier).
 5. Wait for the API, then print the endpoint and a `curl` test (and ping Discord).
 
 Then add your secrets to `.env` (Cloudflare token, Discord webhook) and re-run
@@ -110,12 +112,14 @@ the tunnel's **Public Hostname** tab → **Add a public hostname**):
 | Domain | `yourdomain.com` (pick from the dropdown) |
 | Path | *(leave empty)* |
 | Type | **HTTP** |
-| URL | `localhost:8080` |
+| URL | `caddy:8080` |
 
-> ⚠️ The **URL** must be **HTTP** (not HTTPS — TLS is terminated at Cloudflare's
-> edge) and the **port must match `MR_EDGE_PORT`**: `8080` when Whisper is enabled
-> (traffic goes through the Caddy router), or `8000` (`MR_PORT`) if you set
-> `MR_ENABLE_WHISPER=false`. This single mismatch is the #1 cause of `502`s.
+> ⚠️ The **URL** is `caddy:8080`, not `localhost:8080` — `cloudflared` runs as a
+> container on the same Docker network, so it reaches the router by its compose
+> **service name** (`caddy`). It must be **HTTP** (TLS is terminated at Cloudflare's
+> edge), and the port must match `MR_EDGE_PORT` (`8080` with Whisper on; set it to
+> `vllm:8000` if you run `MR_ENABLE_WHISPER=false`). This mismatch is the #1 cause
+> of `502`s.
 
 Cloudflare auto-creates the DNS record for `ai.yourdomain.com` — you don't add one
 manually.
@@ -131,11 +135,11 @@ curl https://ai.yourdomain.com/v1/models -H "Authorization: Bearer $MR_API_KEY"
 
 | Symptom | Usual cause |
 |---------|-------------|
-| **502 Bad Gateway** | The tunnel's service URL port ≠ `MR_EDGE_PORT`, or vLLM isn't up yet. Check `sudo systemctl status maschinenraum-core` and `tail data/logs/core.log`. |
-| **Error 1033 / "tunnel not found"** | `cloudflared` isn't connected. `sudo systemctl status maschinenraum-tunnel` and `tail data/logs/tunnel.log`; verify the token in `.env`. |
+| **502 Bad Gateway** | Service URL isn't `caddy:8080`, or vLLM isn't up yet. Check `docker compose ps` and `docker compose logs vllm`. |
+| **Error 1033 / "tunnel not found"** | `cloudflared` isn't connected. `docker compose logs cloudflared-token`; verify the token in `.env`. |
 | **DNS won't resolve** | Domain's nameservers aren't on Cloudflare yet, or the hostname wasn't added in step 5. The record's proxy (orange cloud) must be **on**. |
 | **521/523** | Service URL set to `https://...` instead of `http://...`. |
-| **Works locally, not remotely** | You restarted the `core`/`edge` services but not `maschinenraum-tunnel`. |
+| **Works locally, not remotely** | You restarted `vllm`/`caddy` but not the tunnel: `docker compose restart cloudflared-token`. |
 
 > **Optional — lock it to just you two.** Since you're sharing with your wife, you
 > can add **Zero Trust → Access → Applications** in front of the hostname with an
@@ -181,26 +185,29 @@ curl https://<host>/v1/audio/transcriptions -H "Authorization: Bearer $MR_API_KE
 
 ## Operations
 
+All services run under Docker Compose and auto-restart (`restart: unless-stopped`),
+so the stack comes back after a crash or reboot.
+
 ```bash
-# logs
-journalctl -u maschinenraum-core -f          # main model
-tail -f data/logs/core.log                   # same, file
-# control
-sudo systemctl restart maschinenraum-core    # restart after a config change
-sudo systemctl status 'maschinenraum-*'      # everything at a glance
-# notifications on demand
-./lib/metrics_digest.sh health               # send a health ping now
-./lib/metrics_digest.sh digest               # send the weekly digest now
+docker compose ps                  # everything at a glance
+docker compose logs -f vllm        # main model logs
+docker compose restart vllm        # restart after a config change
+docker compose down                # stop the stack
+./setup.sh                         # re-run any time (idempotent) to apply changes
 ```
 
-Switch model: edit `MR_MODEL` in `.env` → `sudo systemctl restart maschinenraum-core`.
+Switch model: edit `MR_MODEL` in `.env` → `docker compose up -d vllm`.
+Health/digest pings come from the `notifier` service automatically; trigger a
+manual run by restarting it: `docker compose restart notifier`.
 
 ## How it works
 
-- `setup.sh` — installer/orchestrator (idempotent).
-- `run.sh core|whisper` — launches a vLLM server; called by systemd.
-- `lib/` — `detect_gpu`, `pick_model`, `cloudflare`, `notify`, `metrics_digest`.
-- `systemd/` — unit + timer templates (`__MR_HOME__`/`__MR_USER__` filled at install).
+- `setup.sh` — installer/orchestrator: installs Docker + the NVIDIA toolkit,
+  writes `.env`/`Caddyfile`, picks profiles, brings the stack up (idempotent).
+- `docker-compose.yml` — services: `vllm`, `whisper` (profile), `caddy`,
+  `cloudflared-token`/`-quick` (profiles), `notifier`.
+- `lib/` — `detect_gpu`, `pick_model`, `notify` (host helpers) and `notifier.py`
+  (the in-container Discord health/digest loop).
 - `Caddyfile` — generated router; one hostname for chat + audio.
 
 ## Potential next steps

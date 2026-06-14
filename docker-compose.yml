@@ -1,0 +1,111 @@
+name: maschinenraum
+
+# All GPU services request the NVIDIA runtime (needs nvidia-container-toolkit).
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+# Cap container logs so they can never fill the disk.
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # ── Core: text + vision (one OpenAI-compatible endpoint) ──────────────────
+  vllm:
+    image: ${MR_VLLM_IMAGE:-vllm/vllm-openai:latest}
+    <<: [*gpu, *logging]
+    restart: unless-stopped
+    ipc: host                      # vLLM needs a large /dev/shm
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    command: >
+      --model ${MR_MODEL}
+      --served-model-name maschinenraum
+      --host 0.0.0.0
+      --port ${MR_PORT:-8000}
+      --api-key ${MR_API_KEY}
+      --gpu-memory-utilization ${MR_GPU_MEMORY_UTILIZATION:-0.90}
+      --enable-prefix-caching
+      ${MR_EXTRA_ARGS:-}
+    volumes:
+      - ./data/hf:/root/.cache/huggingface
+    ports:
+      - "${MR_PORT:-8000}:${MR_PORT:-8000}"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os,urllib.request; urllib.request.urlopen('http://localhost:'+os.environ.get('MR_PORT','8000')+'/health')\""]
+      interval: 30s
+      timeout: 5s
+      retries: 30
+      start_period: 600s           # big models can take a while to load
+
+  # ── Whisper STT (optional: --profile whisper) ────────────────────────────
+  whisper:
+    image: ${MR_VLLM_IMAGE:-vllm/vllm-openai:latest}
+    <<: [*gpu, *logging]
+    profiles: [whisper]
+    restart: unless-stopped
+    ipc: host
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    command: >
+      --model ${MR_WHISPER_MODEL:-openai/whisper-large-v3-turbo}
+      --host 0.0.0.0
+      --port ${MR_WHISPER_PORT:-8001}
+      --api-key ${MR_API_KEY}
+      --gpu-memory-utilization ${MR_WHISPER_GPU_FRACTION:-0.10}
+    volumes:
+      - ./data/hf:/root/.cache/huggingface
+
+  # ── Router: one hostname for chat/vision + audio ─────────────────────────
+  caddy:
+    image: caddy:2
+    <<: *logging
+    restart: unless-stopped
+    depends_on: [vllm]
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./data/caddy:/data
+    ports:
+      - "${MR_EDGE_PORT:-8080}:${MR_EDGE_PORT:-8080}"
+
+  # ── Cloudflare tunnel: named (stable hostname) ──  --profile tunnel-token ─
+  cloudflared-token:
+    image: cloudflare/cloudflared:latest
+    <<: *logging
+    profiles: [tunnel-token]
+    restart: unless-stopped
+    depends_on: [caddy]
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+
+  # ── Cloudflare tunnel: ephemeral quick URL ──────  --profile tunnel-quick ─
+  cloudflared-quick:
+    image: cloudflare/cloudflared:latest
+    <<: *logging
+    profiles: [tunnel-quick]
+    restart: unless-stopped
+    depends_on: [caddy]
+    command: tunnel --no-autoupdate --url http://caddy:${MR_EDGE_PORT:-8080}
+
+  # ── Discord health/digest from vLLM /metrics (tiny, no GPU memory held) ───
+  notifier:
+    image: python:3.12-slim
+    <<: [*gpu, *logging]
+    restart: unless-stopped
+    depends_on: [vllm]
+    env_file: .env
+    environment:
+      MR_VLLM_HOST: vllm
+      NVIDIA_DRIVER_CAPABILITIES: utility   # nvidia-smi only, no compute libs
+    command: ["python3", "/app/notifier.py"]
+    volumes:
+      - ./lib/notifier.py:/app/notifier.py:ro
+      - ./data/state:/data/state

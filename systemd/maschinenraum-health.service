@@ -1,9 +1,0 @@
-[Unit]
-Description=maschinenraum — daily health ping to Discord
-
-[Service]
-Type=oneshot
-User=__MR_USER__
-WorkingDirectory=__MR_HOME__
-EnvironmentFile=__MR_HOME__/.env
-ExecStart=__MR_HOME__/lib/metrics_digest.sh health
